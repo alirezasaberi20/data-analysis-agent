@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+data/
+backend/charts/*.png
+node_modules/
+dist/
+.pytest_cache/
+*.egg-info/
