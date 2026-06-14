@@ -23,6 +23,7 @@ from backend.database.connection import (
 from backend.vector_store.store import SchemaVectorStore
 from backend.sessions.manager import SessionManager
 from backend.agents.orchestrator import create_analysis_graph
+from backend.cache import ResponseCache
 
 
 @asynccontextmanager
@@ -55,6 +56,7 @@ app.mount("/charts", StaticFiles(directory=str(charts_dir)), name="charts")
 
 session_manager = SessionManager()
 analysis_graph = create_analysis_graph()
+response_cache = ResponseCache(max_size=200, ttl_seconds=3600)
 
 
 # ---- Pydantic Models ----
@@ -90,6 +92,21 @@ async def chat(request: ChatRequest):
     session = session_manager.get_or_create_session(request.session_id)
     session.add_message("user", request.message)
 
+    # Check cache first
+    cached = response_cache.get(request.message)
+    if cached:
+        session.add_message("assistant", cached.response, {
+            "charts": cached.charts,
+            "sql_results": cached.sql_results,
+        })
+        return ChatResponse(
+            session_id=session.session_id,
+            response=cached.response,
+            charts=cached.charts,
+            sql_results=cached.sql_results,
+            steps=cached.steps,
+        )
+
     history = session.get_history(max_messages=10)
     lang_messages = []
     for msg in history:
@@ -119,7 +136,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail=error_msg)
 
     final_report = result.get("final_report", "")
-    chart_paths = result.get("chart_paths", [])
+    chart_paths = result.get("chart_paths", []) or result.get("python_chart_paths", [])
     sql_results = result.get("sql_results", [])
 
     chart_urls = []
@@ -138,6 +155,9 @@ async def chat(request: ChatRequest):
         if isinstance(msg, AIMessage) and msg.content:
             content = msg.content[:200]
             steps.append(content)
+
+    # Store in cache
+    response_cache.put(request.message, final_report, chart_urls, sql_results, steps)
 
     return ChatResponse(
         session_id=session.session_id,
@@ -220,9 +240,10 @@ async def upload_file(
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
-        # Re-index vector store so agents know about the new schema
+        # Re-index vector store and invalidate cache so agents see new schema
         vector_store = SchemaVectorStore()
         vector_store.reindex_schema()
+        response_cache.invalidate_all()
 
         tables = get_table_info()
         return {"message": msg, "result": result, "tables": tables}
@@ -239,6 +260,7 @@ async def delete_table(table_name: str):
     if drop_table(table_name):
         vector_store = SchemaVectorStore()
         vector_store.reindex_schema()
+        response_cache.invalidate_all()
         return {"status": "deleted", "table": table_name}
     raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
@@ -264,6 +286,27 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             session.add_message("user", message)
+
+            # Check cache first
+            cached = response_cache.get(message)
+            if cached:
+                session.add_message("assistant", cached.response, {
+                    "charts": cached.charts,
+                    "sql_results": cached.sql_results,
+                })
+                await websocket.send_json({
+                    "type": "step",
+                    "step": "Returning cached result...",
+                    "progress": 100,
+                })
+                await websocket.send_json({
+                    "type": "response",
+                    "response": cached.response,
+                    "charts": cached.charts,
+                    "sql_results": cached.sql_results,
+                    "cached": True,
+                })
+                continue
 
             # Stream step updates
             steps_map = {
@@ -296,14 +339,12 @@ async def websocket_chat(websocket: WebSocket):
             }
 
             try:
-                # Stream through graph nodes
                 step_count = 0
                 final_state = None
 
                 def run_graph():
                     return analysis_graph.invoke(initial_state)
 
-                # Send progress updates while processing
                 async def send_progress():
                     node_names = list(steps_map.keys())
                     for i, node in enumerate(node_names):
@@ -319,7 +360,7 @@ async def websocket_chat(websocket: WebSocket):
                 await progress_task
 
                 final_report = result.get("final_report", "")
-                chart_paths = result.get("chart_paths", [])
+                chart_paths = result.get("chart_paths", []) or result.get("python_chart_paths", [])
                 sql_results = result.get("sql_results", [])
 
                 chart_urls = []
@@ -331,6 +372,9 @@ async def websocket_chat(websocket: WebSocket):
                     "charts": chart_urls,
                     "sql_results": sql_results,
                 })
+
+                # Store in cache
+                response_cache.put(message, final_report, chart_urls, sql_results)
 
                 await websocket.send_json({
                     "type": "response",
@@ -383,3 +427,16 @@ async def delete_session(session_id: str):
     if session_manager.delete_session(session_id):
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Session not found")
+
+
+# ---- Cache Management ----
+
+@app.get("/api/cache/stats")
+async def cache_stats():
+    return response_cache.stats()
+
+
+@app.delete("/api/cache")
+async def clear_cache():
+    removed = response_cache.invalidate_all()
+    return {"status": "cleared", "entries_removed": removed}

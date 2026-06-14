@@ -22,7 +22,7 @@ export default function App() {
   const [currentStep, setCurrentStep] = useState('')
   const [progress, setProgress] = useState(0)
   const [tables, setTables] = useState([])
-  const [showSidebar, setShowSidebar] = useState(false)
+  const [showSidebar, setShowSidebar] = useState(true)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const wsRef = useRef(null)
@@ -70,6 +70,7 @@ export default function App() {
           content: data.response,
           charts: data.charts || [],
           sql_results: data.sql_results || [],
+          cached: data.cached || false,
         }])
         setLoading(false)
         setCurrentStep('')

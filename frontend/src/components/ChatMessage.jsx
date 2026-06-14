@@ -1,9 +1,10 @@
 import React, { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { Bot, User, ChevronDown, ChevronUp, Image, AlertCircle } from 'lucide-react'
+import remarkGfm from 'remark-gfm'
+import { Bot, User, ChevronDown, ChevronUp, Image, AlertCircle, Zap } from 'lucide-react'
 
 export default function ChatMessage({ message }) {
-  const { role, content, charts = [], sql_results = [], isError } = message
+  const { role, content, charts = [], sql_results = [], isError, cached } = message
   const [showSql, setShowSql] = useState(false)
   const isUser = role === 'user'
 
@@ -20,7 +21,23 @@ export default function ChatMessage({ message }) {
           </div>
         ) : (
           <div className="markdown-body">
-            <ReactMarkdown>{content}</ReactMarkdown>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              components={{
+                table: ({ children }) => (
+                  <div className="table-wrapper">
+                    <table>{children}</table>
+                  </div>
+                ),
+              }}
+            >{content}</ReactMarkdown>
+          </div>
+        )}
+
+        {cached && (
+          <div className="cached-badge">
+            <Zap size={12} />
+            Cached response — no tokens used
           </div>
         )}
 

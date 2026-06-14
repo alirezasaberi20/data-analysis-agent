@@ -1,14 +1,23 @@
 """Individual agent nodes for the analysis workflow."""
 
 import re
+import time
+import logging
+from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from openai import RateLimitError
 from backend.config import OPENAI_API_KEY, OPENAI_MODEL
 from backend.tools.sql_tool import sql_query_tool, get_schema_tool
 from backend.tools.python_tool import python_execution_tool
 from backend.tools.chart_tool import chart_generator_tool
 from backend.vector_store.store import SchemaVectorStore
 from backend.database.connection import get_table_info
+
+logger = logging.getLogger(__name__)
+
+_MAX_RETRIES = 4
+_BASE_DELAY = 3.0
 
 
 def _get_llm(temperature: float = 0.0):
@@ -17,6 +26,31 @@ def _get_llm(temperature: float = 0.0):
         api_key=OPENAI_API_KEY,
         temperature=temperature,
     )
+
+
+def _invoke_with_retry(llm, messages, retries=_MAX_RETRIES):
+    """Invoke the LLM with automatic retry on rate-limit (429) errors."""
+    for attempt in range(retries + 1):
+        try:
+            return llm.invoke(messages)
+        except RateLimitError as e:
+            if attempt == retries:
+                raise
+            delay = _BASE_DELAY * (2 ** attempt)
+            logger.warning(f"Rate limited, retrying in {delay:.1f}s (attempt {attempt + 1}/{retries})")
+            time.sleep(delay)
+
+
+def _truncate_tool_output(text: str, max_chars: int = 3000) -> str:
+    """Truncate long tool outputs to reduce token usage in follow-up rounds."""
+    if len(text) <= max_chars:
+        return text
+    # Keep the beginning (stats) and end (CHART_SAVED lines)
+    lines = text.split("\n")
+    chart_lines = [l for l in lines if l.startswith("CHART_SAVED:")]
+    non_chart = [l for l in lines if not l.startswith("CHART_SAVED:")]
+    kept_text = "\n".join(non_chart)[:max_chars - 500]
+    return kept_text + "\n...(output truncated)...\n" + "\n".join(chart_lines)
 
 
 def _extract_user_question(messages: list) -> str:
@@ -112,7 +146,7 @@ IMPORTANT RULES:
 Create a concise plan with numbered steps. Each step should specify what to do.
 Output ONLY the plan, no preamble.""")
 
-    response = llm.invoke([plan_prompt, HumanMessage(content=user_question)])
+    response = _invoke_with_retry(llm, [plan_prompt, HumanMessage(content=user_question)])
 
     return {
         "messages": messages + [AIMessage(content=f"**Analysis Plan:**\n{response.content}")],
@@ -154,7 +188,7 @@ For SQLite date filtering, use strftime().
 Execute each query using the tool.""")
 
     conversation = [sql_prompt, HumanMessage(content=user_question)]
-    response = llm_with_tools.invoke(conversation)
+    response = _invoke_with_retry(llm_with_tools, conversation)
 
     new_messages = list(messages) + [response]
 
@@ -178,7 +212,7 @@ Execute each query using the tool.""")
         followup_messages.append(
             HumanMessage(content="Summarize the SQL query results. Format key data points clearly.")
         )
-        followup = llm.invoke(followup_messages)
+        followup = _invoke_with_retry(llm, followup_messages)
         new_messages.append(followup)
 
     return {
@@ -219,39 +253,93 @@ SQL RESULTS (if any):
 ANALYSIS PLAN:
 {plan}
 
-IMPORTANT GUIDELINES:
-- ALWAYS load data from the target tables using pd.read_sql().
-- After loading, ALWAYS separate numeric and categorical columns:
-    numeric_cols = df.select_dtypes(include='number').columns.tolist()
-    categorical_cols = df.select_dtypes(exclude='number').columns.tolist()
-- For "visualize the dataset" or "show distributions":
-  * Use df.describe() and print statistics
-  * Create histograms/distribution plots for numeric columns ONLY
-  * Create count plots for categorical columns
-- For correlation analysis:
-  * ALWAYS use df[numeric_cols].corr() — NEVER use df.corr() on the full DataFrame
-  * Use sns.heatmap(df[numeric_cols].corr(), annot=True, cmap='coolwarm')
-- For scatter plots: use sns.scatterplot with hue= for categorical grouping
-- Print all findings with print()
-- Create clear, well-labeled charts with titles
-- Use plt.figure(figsize=(10, 6)) before each new chart
-- Call save_chart() after EACH plot to save it (do NOT call plt.show())
+CRITICAL RULES:
+1. ALWAYS handle missing data FIRST:
+   - Print missing value counts: print(df.isnull().sum())
+   - For plotting, use df.dropna(subset=[col]) or df[col].dropna() before each plot
+   - NEVER pass columns with NaN directly to plotting functions without handling them
 
-Example pattern for saving a chart:
-    plt.figure(figsize=(10, 6))
-    sns.histplot(df['column'], kde=True)
-    plt.title('Distribution of Column')
-    save_chart()
+2. Separate numeric and categorical columns IMMEDIATELY after loading:
+   numeric_cols = df.select_dtypes(include='number').columns.tolist()
+   categorical_cols = df.select_dtypes(exclude='number').columns.tolist()
+
+3. LARGE DATASET HANDLING (CRITICAL for datasets > 5000 rows):
+   - For distribution plots (histplot, kdeplot): use bins=50 and set kde=False if rows > 10000
+   - NEVER use sns.pairplot() on datasets with > 5000 rows — it creates N² scatter plots
+   - Instead of pairplot, create individual scatter plots for the 2-3 most interesting variable pairs
+   - For boxplots on many columns, plot them in groups of 4-5 per figure
+
+4. DO NOT use `import` statements for common modules — they are ALREADY available:
+   pd, np, plt, sns, warnings, math, Counter, defaultdict are all pre-loaded.
+   You CAN import: warnings, math, re, datetime, itertools, collections, json, scipy, sklearn
+   Do NOT import anything else.
+
+5. Wrap EACH chart in its own try/except so one failure doesn't kill the rest:
+   try:
+       plt.figure(figsize=(10, 6))
+       sns.histplot(df[col].dropna(), kde=True)
+       plt.title(f'Distribution of {{col}}')
+       save_chart()
+   except Exception as e:
+       print(f"Chart error for {{col}}: {{e}}")
+
+6. NEVER use plt.show() — always use save_chart()
+7. ALWAYS use df[numeric_cols].corr() for correlation — never df.corr()
+8. Use plt.figure(figsize=(10, 6)) BEFORE each new chart
+9. Call save_chart() AFTER each chart to save it
+10. For ALL tabular output (describe, corr, head, value_counts, crosstab, etc.), ALWAYS use .to_markdown():
+    print(df.describe().to_markdown())
+    print(df[numeric_cols].corr().round(2).to_markdown())
+    print(df.head(10).to_markdown())
+    NEVER use print(df) or print(df.to_string()) — always .to_markdown() so tables render properly
+
+CHART GENERATION — YOU MUST ACTUALLY CREATE THESE CHARTS:
+When asked for EDA / distributions / box plots, generate ALL of these (each in its own try/except):
+1. A histogram (sns.histplot) for EACH numeric column — loop through numeric_cols
+2. A box plot for EACH numeric column — loop through numeric_cols
+3. A count plot for EACH categorical column — loop through categorical_cols
+4. A correlation heatmap using sns.heatmap on df[numeric_cols].corr()
+5. 1-2 scatter plots for the most correlated variable pairs
+
+Example loop for distributions:
+    for col in numeric_cols:
+        try:
+            plt.figure(figsize=(10, 6))
+            sns.histplot(df[col].dropna(), bins=50, kde=len(df) < 10000)
+            plt.title(f'Distribution of {{col}}')
+            plt.xlabel(col)
+            save_chart()
+        except Exception as e:
+            print(f"Chart error for {{col}}: {{e}}")
+
+Example loop for box plots:
+    for col in numeric_cols:
+        try:
+            plt.figure(figsize=(10, 6))
+            sns.boxplot(x=df[col].dropna())
+            plt.title(f'Box Plot of {{col}}')
+            save_chart()
+        except Exception as e:
+            print(f"Box plot error for {{col}}: {{e}}")
+
+You MUST generate at least one chart per numeric column. Do NOT just describe charts in text — actually create them with save_chart().
 """)
 
     user_question = _extract_user_question(messages)
-    response = llm_with_tools.invoke([python_prompt, HumanMessage(content=user_question)])
 
-    new_messages = list(messages) + [response]
+    new_messages = list(messages)
     analysis_output = ""
     python_chart_paths = []
 
-    if response.tool_calls:
+    # Allow up to 5 rounds of tool calls for multi-step analysis
+    conversation = [python_prompt, HumanMessage(content=user_question)]
+    for round_num in range(5):
+        response = _invoke_with_retry(llm_with_tools, conversation)
+        new_messages.append(response)
+
+        if not response.tool_calls:
+            break
+
         for tool_call in response.tool_calls:
             result = python_execution_tool.invoke(tool_call["args"])
             analysis_output += result + "\n"
@@ -265,6 +353,27 @@ Example pattern for saving a chart:
                 tool_call_id=tool_call["id"],
             )
             new_messages.append(tool_msg)
+
+        # Build trimmed conversation for next round to reduce token usage.
+        # Keep: system prompt + user question + last AI message + its tool results.
+        # Older rounds are summarised by a short note.
+        recent_msgs = new_messages[len(messages):]
+        if round_num > 0 and len(recent_msgs) > 6:
+            charts_so_far = len(python_chart_paths)
+            summary = AIMessage(content=f"[Previous rounds generated {charts_so_far} charts and printed statistics. Continue with the remaining analysis.]")
+            # Keep only the system prompt, summary, and the last AI + tool messages
+            last_ai_idx = None
+            for i in range(len(recent_msgs) - 1, -1, -1):
+                if hasattr(recent_msgs[i], 'tool_calls') and recent_msgs[i].tool_calls:
+                    last_ai_idx = i
+                    break
+            if last_ai_idx is not None:
+                trimmed = [summary] + recent_msgs[last_ai_idx:]
+            else:
+                trimmed = recent_msgs[-4:]
+            conversation = [python_prompt, HumanMessage(content=user_question)] + trimmed
+        else:
+            conversation = [python_prompt] + recent_msgs
 
     return {
         "messages": new_messages,
@@ -325,7 +434,7 @@ PLAN: {plan}
 Create 1-3 relevant charts using real data from the results.""")
 
     user_question = _extract_user_question(messages)
-    response = llm_with_tools.invoke([chart_prompt, HumanMessage(content=user_question)])
+    response = _invoke_with_retry(llm_with_tools, [chart_prompt, HumanMessage(content=user_question)])
 
     new_messages = list(messages) + [response]
     chart_paths = []
@@ -361,7 +470,16 @@ def insight_agent_node(state: dict) -> dict:
 
     llm = _get_llm(temperature=0.3)
 
-    charts_info = "\n".join(f"- Chart: {p}" for p in chart_paths) if chart_paths else "No charts generated."
+    num_charts = len(chart_paths)
+
+    # Strip CHART_SAVED lines and trim to avoid token bloat
+    clean_analysis = "\n".join(
+        line for line in analysis_results.split("\n")
+        if not line.startswith("CHART_SAVED:")
+    ).strip() if analysis_results else ""
+    # Cap the analysis output to ~6000 chars to stay within token limits
+    if len(clean_analysis) > 6000:
+        clean_analysis = clean_analysis[:6000] + "\n...(output truncated for brevity)..."
 
     insight_prompt = SystemMessage(content=f"""You are a senior data analyst. Synthesize all the analysis results
 into a clear, comprehensive report.
@@ -375,31 +493,52 @@ SQL RESULTS:
 {chr(10).join(sql_results[:5]) if sql_results else 'No SQL results.'}
 
 PYTHON ANALYSIS OUTPUT:
-{analysis_results if analysis_results else 'No Python analysis output.'}
+{clean_analysis if clean_analysis else 'No Python analysis output.'}
 
-GENERATED CHARTS:
-{charts_info}
+NUMBER OF CHARTS GENERATED: {num_charts}
 
-Write a comprehensive response that:
-1. Directly answers the user's original question
-2. Highlights key findings with specific numbers
-3. Identifies patterns, distributions, or trends
-4. Provides observations and recommendations where relevant
-5. Mentions the generated charts
+REPORT STRUCTURE — follow this order:
+
+## 1. Dataset Overview
+- Number of rows, columns, data types
+- List the columns
+
+## 2. Summary Statistics
+- INCLUDE the full summary statistics table from the Python output (the .describe() output).
+- If the Python output contains a markdown table for describe(), COPY IT INTO YOUR REPORT EXACTLY.
+- This is the most important section — users want to see min, max, mean, std, quartiles.
+
+## 3. Missing Values
+- Show which columns have missing values and how many, as a markdown table.
+
+## 4. Key Findings
+- Describe distribution shapes (skewed, normal, bimodal, etc.) based on the printed statistics
+- Highlight outliers visible from min/max vs mean/std
+- Mention correlations with specific numbers from the correlation matrix
+- Describe categorical variable distributions
+
+## 5. Observations and Recommendations
+- Actionable insights based on the data
+- Data quality issues to address
+
+## 6. Generated Visualizations
+- Just write: "{num_charts} charts were generated and are displayed below, including histograms, box plots, correlation heatmap, and scatter plots."
+- Do NOT list individual chart filenames — they are displayed automatically.
+- Do NOT list chart_XXXXX names — they are meaningless to the user.
 
 FORMATTING RULES:
 - Use proper markdown formatting throughout.
-- For ANY tabular data (correlation matrices, comparisons, statistics), use markdown tables:
-  | Column A | Column B | Column C |
-  |----------|----------|----------|
-  | value    | value    | value    |
-- NEVER output raw pipe-separated text or plain text tables. Always use proper markdown table syntax.
-- Use headers, bold, bullet points for readability.
-- Keep the report concise but thorough.""")
+- For ANY tabular data, you MUST use markdown tables with proper syntax:
+  | Column A | Column B |
+  |----------|----------|
+  | value1   | value2   |
+- The separator row is REQUIRED after the header row.
+- If the Python output already contains markdown tables, COPY THEM EXACTLY into your report.
+- Use ## headers, **bold**, and bullet points for readability.""")
 
     user_question = _extract_user_question(messages)
 
-    response = llm.invoke([
+    response = _invoke_with_retry(llm, [
         insight_prompt,
         HumanMessage(content=f"Original question: {user_question}\n\nProvide the final analysis report."),
     ])
